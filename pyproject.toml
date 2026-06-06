@@ -26,6 +26,7 @@ dependencies = [
     "google-genai>=1.65.0",
     "sentencepiece>=0.2.1",
     "sentence-transformers>=5.2.3",
+    "torch>=2.0.0",
 ]
 
 [dependency-groups]
@@ -38,5 +39,11 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
 [tool.uv.sources]
 aiavatar = { path = "./lib/aiavatarkit" }
+torch = { index = "pytorch-cu121" }

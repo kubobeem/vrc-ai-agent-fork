@@ -47,21 +47,47 @@ class AudioInputPipeline:
         # ※ローカル版の SileroSpeechDetector は device_index を直接受け取らない仕様
         self.vad = SileroSpeechDetector(
             debug=True,
-            silence_duration_threshold=0.7,  # 発話終了と判定する無音区間(秒)。。デフォルト0.5
-            min_duration=0.3,  # 短い音は発話として扱わない。デフォルト0.2
-            # volume_db_threshold=-40.0,     # 指定した音量(dB)より小さい音は無視する。デフォルトNone
-            # speech_probability_threshold=0.7 # 声の判定確率のしきい値。デフォルト0.5
+            silence_duration_threshold=0.7,  # 発話終了と判定する無音区間(秒)
+            min_duration=0.3,                 # 短い音は発話として扱わない
         )
 
         # STTのセットアップ (Faster-Whisper)
+        # 環境変数 STT_DEVICE や STT_COMPUTE_TYPE が明示されていればそれを利用し、
+        # なければCUDA (GPU) の有無を自動判定してフォールバックします。
+        env_device = os.getenv("STT_DEVICE", "").strip()
+        env_compute_type = os.getenv("STT_COMPUTE_TYPE", "").strip()
+
+        if env_device:
+            stt_device = env_device
+            stt_compute_type = env_compute_type if env_compute_type else "default"
+            logger.info(
+                f"[AudioInputPipeline] 環境変数 STT_DEVICE によりSTTデバイスを設定: device={stt_device}, compute_type={stt_compute_type}"
+            )
+        else:
+            # GPUが使えるか self._has_cuda() でチェックします
+            if self._has_cuda():
+                stt_device = "cuda"
+                stt_compute_type = env_compute_type if env_compute_type else "float16"
+                logger.info(
+                    "[AudioInputPipeline] GPU (CUDA) を検出しました。GPU上で高速に音声認識を行います。"
+                )
+            else:
+                stt_device = "cpu"
+                # CPUでSTTを行う場合、int8（8ビット整数演算）を指定しないと重すぎてまともに処理できません
+                stt_compute_type = env_compute_type if env_compute_type else "int8"
+                logger.info(
+                    "[AudioInputPipeline] GPUが利用できないため、CPU動作に自動フォールバックします (演算: int8)。"
+                )
+
         stt_model_size = os.getenv("STT_MODEL_SIZE", "base")
         self.stt = FasterWhisperSpeechRecognizer(
             model_size=stt_model_size,
-            device="cuda",
+            device=stt_device,
+            compute_type=stt_compute_type,
             language="ja",
         )
 
-        # 発話検知時のフックを登録 (メソッド呼び出しで登録)
+        # 発話検知時のフックを登録
         self.vad.on_speech_detected(self._on_speech_detected)
         self.vad.on_voiced(self._on_voiced)
 
@@ -82,7 +108,7 @@ class AudioInputPipeline:
             )
 
     def _has_cuda(self) -> bool:
-        """簡単なCUDA利用可否チェック（精度は必要に応じて調整）"""
+        """簡単なCUDA利用可否チェック"""
         try:
             import torch
 
@@ -92,7 +118,7 @@ class AudioInputPipeline:
 
     async def _on_voiced(self, session_id: str):
         """
-        VADが声の第一声を検知した瞬間に呼ばれるコールバック。
+        VADが声の第一声を検知した瞬間に呼ばれる。
         再生中のタスクがあれば即座にキャンセルする。
         """
         if self.ctx.say_task and not self.ctx.say_task.done():
@@ -100,7 +126,6 @@ class AudioInputPipeline:
                 f"[AudioInputPipeline] Cancelling say_task due to immediate voice detection (session: {session_id})"
             )
             self.ctx.say_task.cancel()
-            # 中断した情報をセッションデータに保存（発話完了時に利用）
             self.vad.set_session_data(
                 session_id, "interrupted_action", "say", create_session=True
             )
@@ -117,12 +142,13 @@ class AudioInputPipeline:
         VADが発話を検知し終わった際に呼ばれるコールバック。
         音声データを受け取り、STTで文字起こしを行ってキューに積む。
         """
-        logger.debug(
+        logger.info(
             f"[AudioInputPipeline] Speech detected. Audio data size: {len(audio_data)} bytes. Transcribing..."
         )
 
         try:
             speaker_prefix = ""
+
             # 話者識別ゲートによるフィルタリング
             if self.speaker_registry is not None:
                 gate_result = await asyncio.to_thread(
@@ -151,7 +177,6 @@ class AudioInputPipeline:
                 speaker_prefix = f"[{name} {gate_result.chosen.speaker_id}]: "
 
             # STTを実行
-            # ※FasterWhisperSpeechRecognizer.transcribe は内部で run_in_executor を使いノンブロッキングに設計されている
             text = await self.stt.transcribe(audio_data)
             text = text.strip()
 
@@ -170,12 +195,11 @@ class AudioInputPipeline:
 
             logger.info(f"[AudioInputPipeline] Transcription result: {text}")
 
-            # 中断情報の取得（_on_voicedが実行されていれば値が入っている）
+            # 中断情報の取得
             interrupted_action = self.vad.get_session_data(
                 session_id, "interrupted_action"
             )
             if interrupted_action:
-                # 取得後にクリアして次回の発話に持ち越さないようにする
                 self.vad.set_session_data(session_id, "interrupted_action", None)
 
             # キューに積む
@@ -200,11 +224,9 @@ class AudioInputPipeline:
         """
         logger.info("[AudioInputPipeline] Starting VAD listening loop...")
         try:
-            # ローカル版 aiavatarkit に合わせて、AudioRecorder でマイクからストリームを取得し
-            # VAD の process_stream に渡す
             from aiavatar.device.audio import AudioRecorder, AudioDevice
 
-            # デバイスIDを取得 (-1が指定されている場合はAudioDeviceがデフォルトデバイスを解決する)
+            # デバイスIDを取得 (-1ならデフォルトデバイス)
             resolved_device_index = AudioDevice(
                 input_device=self.input_device
             ).input_device
@@ -212,12 +234,11 @@ class AudioInputPipeline:
                 f"[AudioInputPipeline] Resolved Input Device Index: {resolved_device_index}"
             )
 
-            # AudioRecorder の初期化
             recorder = AudioRecorder(
-                sample_rate=self.vad.sample_rate, device_index=resolved_device_index
+                sample_rate=self.vad.sample_rate,
+                device_index=resolved_device_index,
             )
 
-            # セッションIDをUUIDで発行（ユーザーの発話単位）
             session_id = str(uuid.uuid4())
 
             logger.info(
@@ -225,9 +246,10 @@ class AudioInputPipeline:
             )
             stream = recorder.start_stream()
 
-            # VAD にストリームを流し込む
             logger.info("[AudioInputPipeline] Streaming to VAD...")
+            logger.debug("[AudioInputPipeline] DEBUG: waiting for voice...")
             await self.vad.process_stream(stream, session_id=session_id)
+            logger.debug("[AudioInputPipeline] DEBUG: process_stream returned")
 
         except Exception as e:
             logger.error(
